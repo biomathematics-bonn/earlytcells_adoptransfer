@@ -1,0 +1,16 @@
+name: squidpy_env
+channels:
+  - defaults
+dependencies:
+  - jupyterlab
+  - matplotlib
+  - python=3.10
+  - conda-forge::pandoc
+  - scanpy
+  - leidenalg
+  - squidpy
+  - python-igraph
+  - seaborn
+  - notebook
+  - conda-forge::alphashape
+prefix: /home/lisa1/.conda/envs/squidpy_env

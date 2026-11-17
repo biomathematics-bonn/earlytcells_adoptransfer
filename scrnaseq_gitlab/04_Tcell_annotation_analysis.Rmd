@@ -1,0 +1,1568 @@
+---
+title: "scRNA-seq adoptive transfer – 04 T-cell annotation and analyses"
+author: "Lisa M. Steinheuer"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+abstract: |
+  Embedding and annotation of the T cells, marker genes and cell-type composition over sampling days,
+  module scores, and Tfh / Th1 / Th0 signature enrichment.
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: united
+    highlight: tango
+---
+
+**Input:**
+
+* `RDS_integrated_Seurat_T_B.rds` (03)
+
+**Output:**
+
+* `RDS_Tcells_annotated.rds` – T cells (singlets) with final annotation `Celltype_2`
+* figures (`results/figures/`) and signature / ORA tables (`results/tables/`)
+
+Steps
+
+1. T-cell embedding (all days, 20 PCs) and Louvain clustering (resolution 0.8); doublets removed
+2. Final annotation `Celltype_2` (Th0 I–VI, Pre-Tfh I/II/proliferating, Tfh, Pre-Th1 I/II/proliferating, Th1, Unknown 1–3)
+3. Figures: UMAPs, composition per day, marker dot plots / heatmap
+4. Module scores (MSigDB and custom signatures)
+5. Composition after downsampling to the smallest sample
+6. Over-representation of Day-6 Tfh / Th1 and Day-0 signatures in the markers of every population
+
+**Figure panels produced here** (files in `results/figures/`, panel as prefix)
+
+| panel | output |
+|---|---|
+| Fig. 2a | `Fig2a_UMAP_celltypes.pdf` |
+| Fig. 2b | `Fig2b_DotPlot_markers_celltypes.pdf` |
+| Fig. 2c | `Fig2c_UMAP_celltypes_per_day_downsampled.pdf` |
+| Fig. 2d | `Fig2d_StackedBarplot_celltypes_per_day.pdf` |
+| Fig. 2e | `Fig2e_Heatmap_TfhTh1_genes_zscore.pdf` |
+| Fig. 3a | `Fig3a_Tcell_module_scores_grouped_zscore.pdf` |
+| Fig. 6d (right) | `Fig6d_right_DotPlot_day6_Tfh_vs_Th1.pdf` |
+| Suppl. Fig. 2b | `SuppFig2b_DotPlot_markers_by_day.pdf` |
+
+All other figures (`F_*`, `Tcell_module_scores*`, `F_Enrichment_*`) are supporting plots that are not in the manuscript.
+`RDS_Tcells_annotated.rds` is the reference for the label transfer in `05_TCR_CD62L_KLF2_mouse.ipynb` (Fig. 5d–f, 6c).
+
+# Setup
+
+Conda environment: *Seurat_V4*.
+
+## knitr options
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 5, fig.height = 4)
+```
+
+## Libraries
+
+```{r libraries}
+library(spatstat.core)   # required by Seurat v4
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(patchwork)
+library(msigdbr)
+```
+
+## Paths and settings
+
+```{r paths}
+rdata   <- "../RData/"
+results <- "../results/"
+
+fig_dir   <- paste0(results, "figures/")
+table_dir <- paste0(results, "tables/")
+dir.create(fig_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(table_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+## Colors and orders
+
+```{r colors}
+# Sampling days -----------------------------------------------------------
+color_vector_samples <- c(
+  "Day0" = "#fdb863",
+  "Day2" = "#e66101",
+  "Day4" = "#b2abd2",
+  "Day6" = "#54009E")
+
+color_vector_samples_gradient <- c(
+  "Day0" = "#feebe2",
+  "Day2" = "#fbb4b9",
+  "Day4" = "#f768a1",
+  "Day6" = "#ae017e")
+
+# Final annotation ("Celltype_2") incl. Unknowns ---------------------------
+celltype_colors_2 <- c(
+  "Th0 I" = "#a1d99b", "Th0 II" = "#74c476", "Th0 III" = "#41ab5d",
+  "Th0 IV" = "#238b45", "Th0 V" = "#006d2c", "Th0 VI" = "#00441b",
+  "Tfh" = "#08519c", "Pre-Tfh I" = "#3182bd", "Pre-Tfh II" = "#6baed6",
+  "Pre-Tfh proliferating" = "#bdd7e7",
+  "Th1" = "#a50f15", "Pre-Th1 I" = "#de2d26", "Pre-Th1 II" = "#fb6a4a",
+  "Pre-Th1 proliferating" = "#fcae91",
+  "Unknown 1" = "#bdbdbd", "Unknown 2" = "#969696", "Unknown 3" = "#636363"
+)
+
+# Final annotation ("Celltype_2") without Unknowns -------------------------
+celltype_colors_3 <- celltype_colors_2[!grepl("^Unknown", names(celltype_colors_2))]
+
+# Grouped populations ("Celltype_grouped") ---------------------------------
+celltype_colors_grouped <- c(
+  "Th0" = "#238b45",
+  "Pre-Tfh" = "#6baed6",
+  "Pre-Tfh proliferating" = "#3182bd",
+  "Tfh" = "#08519c",
+  "Pre-Th1" = "#fb6a4a",
+  "Pre-Th1 proliferating" = "#de2d26",
+  "Th1" = "#a50f15"
+)
+
+# Orders ------------------------------------------------------------------
+unknown_types <- c("Unknown 1", "Unknown 2", "Unknown 3")
+
+# Biological order of Celltype_2 (without Unknowns), used for ORA heatmaps
+cluster_order <- c(
+  "Th0 I", "Th0 II", "Th0 III", "Th0 IV", "Th0 V", "Th0 VI",
+  "Pre-Tfh I", "Pre-Tfh II", "Pre-Tfh proliferating", "Tfh",
+  "Pre-Th1 I", "Pre-Th1 II", "Pre-Th1 proliferating", "Th1"
+)
+
+# Biological order of grouped populations
+celltype_levels <- c(
+  "Th0",
+  "Pre-Tfh", "Pre-Tfh proliferating", "Tfh",
+  "Pre-Th1", "Pre-Th1 proliferating", "Th1"
+)
+celltype_grouped_order <- celltype_levels
+
+# Marker panel for dot plots
+features_plot <- c(
+  # Naive
+  "Ccr7", "S1pr1", "Selplg",
+  # Tfh
+  "Cxcr5", "Pdcd1", "Icos", "Bcl6", "Il21", "Klf2",
+  # Th1
+  "Tbx21", "S100a4", "Id2",
+  # Treg / proliferation
+  "Il2ra", "Mki67"
+)
+```
+
+## Functions
+
+### General helpers
+
+```{r functions-general}
+# Marker dot plot (blue-white-red) used throughout the annotation
+marker_dotplot <- function(object, group.by) {
+  DotPlot(object, features = features_plot, group.by = group.by, assay = "RNA") +
+    scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                          space = "Lab", na.value = "grey50") +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+}
+
+# UMAP by sample + UMAP by cluster + marker dot plot
+umap_cluster_overview <- function(object, rel_widths_top = c(1, 1), rel_heights = c(1, 1)) {
+  p1 <- DimPlot(object, reduction = "umap", group.by = "orig.ident", cols = color_vector_samples) +
+    ggtitle("T cells colored by sample")
+  p2 <- DimPlot(object, reduction = "umap", label = TRUE, repel = TRUE, group.by = "seurat_clusters") +
+    ggtitle("T cells colored by cluster")
+  p3 <- marker_dotplot(object, group.by = "seurat_clusters")
+
+  top_row <- cowplot::plot_grid(p1, p2, labels = c("A", "B"), align = 'h', rel_widths = rel_widths_top)
+  cowplot::plot_grid(top_row, p3, labels = c("", "C"), ncol = 1, rel_heights = rel_heights)
+}
+```
+
+### Signature over-representation analysis (ORA)
+
+```{r functions-ora}
+# ------------------------------------------------------------
+# Extract an up-regulated gene signature from a FindMarkers table
+# ------------------------------------------------------------
+extract_signature <- function(marker_table, logfc_cutoff = 1, padj_cutoff = 0.05) {
+  marker_table %>%
+    rownames_to_column("Gene") %>%
+    filter(avg_log2FC > logfc_cutoff, p_val_adj <= padj_cutoff) %>%
+    pull(Gene) %>%
+    unique()
+}
+
+# ------------------------------------------------------------
+# One-sided Fisher ORA per cluster (signature NOT restricted to universe)
+# Used for the first, cluster-level analysis
+# ------------------------------------------------------------
+run_ora_unrestricted <- function(degs_filtered, signature_genes, gene_universe, type_name) {
+  ora_results <- degs_filtered %>%
+    group_by(cluster) %>%
+    summarise(
+      a = length(intersect(gene, signature_genes)),                        # interest ∩ DEG
+      b = length(setdiff(gene, signature_genes)),                          # DEG not in interest
+      c = length(setdiff(signature_genes, gene)),                          # interest not DEG
+      d = length(setdiff(gene_universe, union(gene, signature_genes))),    # not in either
+      .groups = "drop"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      p_value = fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), alternative = "greater")$p.value,
+      odds_ratio = fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), alternative = "greater")$estimate
+    ) %>%
+    ungroup()
+
+  ora_results$p_adj <- p.adjust(ora_results$p_value, method = "BH")
+  ora_results %>% mutate(Type = type_name)
+}
+
+# ------------------------------------------------------------
+# One-sided Fisher ORA per cluster (signature restricted to universe)
+# Used for the per-day analysis
+# ------------------------------------------------------------
+run_ora <- function(degs_filtered, signature_genes, gene_universe, type_name) {
+
+  # Only genes measurable in the current dataset
+  signature_genes <- intersect(unique(signature_genes), gene_universe)
+
+  ora_results <- degs_filtered %>%
+    group_by(cluster) %>%
+    summarise(
+      a = length(intersect(gene, signature_genes)),                        # marker AND signature
+      b = length(setdiff(gene, signature_genes)),                          # marker, not signature
+      c = length(setdiff(signature_genes, gene)),                          # signature, not marker
+      d = length(setdiff(gene_universe, union(gene, signature_genes))),    # neither
+      .groups = "drop"
+    ) %>%
+    rowwise() %>%
+    mutate(
+      fisher_result = list(
+        fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), alternative = "greater")
+      ),
+      p_value = fisher_result$p.value,
+      odds_ratio = unname(fisher_result$estimate)
+    ) %>%
+    ungroup() %>%
+    select(-fisher_result)
+
+  # BH correction across cell types
+  ora_results$p_adj <- p.adjust(ora_results$p_value, method = "BH")
+  ora_results %>% mutate(Type = type_name)
+}
+
+# ------------------------------------------------------------
+# ORA for all grouped populations (incl. populations without markers)
+# ------------------------------------------------------------
+run_signature_ora <- function(degs_filtered, signature_genes, gene_universe,
+                              signature_name, celltype_levels) {
+
+  signature_genes <- intersect(unique(signature_genes), gene_universe)
+
+  if (length(signature_genes) == 0) {
+    stop(paste("Empty signature:", signature_name))
+  }
+
+  ora_results <- lapply(celltype_levels, function(ct) {
+
+    cluster_genes <- degs_filtered %>%
+      filter(as.character(cluster) == ct) %>%
+      pull(gene) %>%
+      unique()
+    cluster_genes <- intersect(cluster_genes, gene_universe)
+
+    # Contingency table
+    a <- length(intersect(cluster_genes, signature_genes))
+    b <- length(setdiff(cluster_genes, signature_genes))
+    c <- length(setdiff(signature_genes, cluster_genes))
+    d <- length(setdiff(gene_universe, union(cluster_genes, signature_genes)))
+
+    ft <- fisher.test(matrix(c(a, b, c, d), nrow = 2, byrow = TRUE), alternative = "greater")
+
+    data.frame(
+      cluster = ct,
+      a = a, b = b, c = c, d = d,
+      overlap = a,
+      n_markers = length(cluster_genes),
+      signature_size = length(signature_genes),
+      p_value = ft$p.value,
+      odds_ratio = unname(ft$estimate)
+    )
+  }) %>%
+    bind_rows()
+
+  ora_results %>%
+    mutate(
+      p_adj = p.adjust(p_value, method = "BH"),
+      Type = signature_name,
+      cluster = factor(cluster, levels = celltype_levels)
+    )
+}
+
+# ------------------------------------------------------------
+# Bin adjusted P values for the heatmaps
+# ------------------------------------------------------------
+bin_padj <- function(p_adj, symbol = "≤") {
+  lv <- c("> 0.1", paste(symbol, c("0.1", "0.01", "0.001", "0.0001")))
+  bins <- case_when(
+    is.na(p_adj) ~ lv[1],
+    p_adj <= 0.0001 ~ lv[5],
+    p_adj <= 0.001 ~ lv[4],
+    p_adj <= 0.01 ~ lv[3],
+    p_adj <= 0.1 ~ lv[2],
+    TRUE ~ lv[1]
+  )
+  factor(bins, levels = lv)
+}
+
+padj_fill_scale <- function(symbol = "≤", name = "adjusted P") {
+  lv <- c("> 0.1", paste(symbol, c("0.1", "0.01", "0.001", "0.0001")))
+  scale_fill_manual(
+    values = setNames(c("grey80", "#fee08b", "#f46d43", "#d73027", "#7f0000"), lv),
+    drop = FALSE,
+    name = name
+  )
+}
+
+# ------------------------------------------------------------
+# Analyze one day: markers per Celltype_2, ORA for T0 / Tfh / Th1, heatmap
+# ------------------------------------------------------------
+analyze_day <- function(seurat_object, day_name, tfh_signature, th1_signature,
+                        t0_signature, cluster_order) {
+
+  message("\n========================================")
+  message("Analyzing: ", day_name)
+  message("========================================")
+
+  # Subset to current day
+  day_object <- subset(seurat_object, subset = orig.ident == day_name)
+  DefaultAssay(day_object) <- "RNA"
+
+  # IMPORTANT: use Celltype_2 rather than seurat_clusters
+  Idents(day_object) <- "Celltype_2"
+
+  # Remove Unknown populations
+  cells_keep <- rownames(day_object@meta.data)[
+    !is.na(day_object$Celltype_2) &
+      !day_object$Celltype_2 %in% unknown_types
+  ]
+  day_object <- subset(day_object, cells = cells_keep)
+
+  # QC: cells per Celltype_2
+  message("\nCell numbers:")
+  print(table(day_object$Celltype_2))
+
+  # Gene universe
+  gene_universe <- rownames(day_object[["RNA"]])
+
+  # Markers for every Celltype_2
+  signature.cell.markers <- FindAllMarkers(day_object, only.pos = TRUE)
+
+  degs_filtered <- signature.cell.markers %>%
+    filter(p_val_adj < 0.1) %>%
+    filter(gene %in% gene_universe)
+
+  # ORA per signature
+  ora_results_tfh <- run_ora(degs_filtered, tfh_signature, gene_universe, "Tfh")
+  ora_results_th1 <- run_ora(degs_filtered, th1_signature, gene_universe, "Th1")
+  ora_results_t0  <- run_ora(degs_filtered, t0_signature, gene_universe, "T0")
+
+  combined_ora <- bind_rows(ora_results_tfh, ora_results_th1, ora_results_t0)
+
+  # Heatmap data
+  heatmap_data <- combined_ora %>%
+    mutate(cluster = as.character(cluster)) %>%
+    filter(!cluster %in% unknown_types) %>%
+    dplyr::select(cluster, p_adj, odds_ratio, Type) %>%
+    tidyr::complete(cluster, Type) %>%
+    mutate(
+      cluster = factor(cluster, levels = cluster_order),
+      Type = factor(Type, levels = c("T0", "Tfh", "Th1")),
+      p_bin = bin_padj(p_adj, symbol = "<=")
+    )
+
+  # Heatmap
+  p <- ggplot(heatmap_data, aes(x = cluster, y = Type, fill = p_bin)) +
+    geom_tile(color = "black", linewidth = 0.3) +
+    padj_fill_scale(symbol = "<=") +
+    labs(title = paste("Signature enrichment -", day_name), x = "Cell type", y = NULL) +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  ggsave(
+    filename = paste0(fig_dir, "F_Enrichment_", day_name, "_Celltype2.pdf"),
+    plot = p, width = 7, height = 3
+  )
+
+  list(
+    day = day_name,
+    object = day_object,
+    markers = signature.cell.markers,
+    degs_filtered = degs_filtered,
+    ora_tfh = ora_results_tfh,
+    ora_th1 = ora_results_th1,
+    ora_t0 = ora_results_t0,
+    combined_ora = combined_ora,
+    heatmap_data = heatmap_data,
+    plot = p
+  )
+}
+```
+
+# Load data
+
+```{r load-data}
+seurat.integrated <- readRDS(file = paste0(rdata, "RDS_integrated_Seurat_T_B.rds"))
+```
+
+```{r umap-integrated, fig.width = 5, fig.height = 4, fig.cap = "UMAP of the integrated T and B cells colored by cell type."}
+DimPlot(seurat.integrated, reduction = "umap", label = FALSE, pt.size = 0.5, group.by = "Celltype")
+```
+
+```{r subset-celltypes}
+t_cells <- subset(seurat.integrated, Celltype %in% 'T-cells')
+```
+
+```{r table-celltype-count}
+table(seurat.integrated@meta.data$Celltype)
+rm(seurat.integrated)
+```
+
+# T cell embedding and annotation
+
+The annotation was developed iteratively (reference embedding of Day 0 + Day 6 with mapping of Day 2 + 4, and a
+first cluster annotation); the final annotation below is based only on the embedding of all days together.
+
+## Final embedding: all days together
+
+All days embedded together: 20 PCs, Louvain resolution 0.8; doublets (scDblFinder) removed.
+
+```{r umap-check-t-20, fig.width = 10, fig.height = 8, fig.cap = "UMAP of all T cells (20 dimensions). (A) Sample (B) Seurat Clusters (C) Dotplot showing marker genes."}
+DefaultAssay(t_cells) <- "RNA"
+all.genes <- rownames(t_cells)
+t_cells <- ScaleData(t_cells, features = all.genes)
+
+DefaultAssay(t_cells) <- "integrated"
+t_cells <- ScaleData(t_cells, verbose = FALSE)
+t_cells <- RunPCA(t_cells, npcs = 25, verbose = FALSE)
+t_cells <- FindNeighbors(t_cells, dims = 1:20)
+t_cells <- FindClusters(t_cells, resolution = 0.8)
+t_cells <- RunUMAP(t_cells, reduction = "pca", dims = 1:20, return.model = TRUE)
+t_cells <- subset(t_cells, Doublets == "singlet")
+
+umap_cluster_overview(t_cells)
+```
+
+## Final annotation (Celltype_2)
+
+```{r final-annotation, fig.width = 8}
+Idents(t_cells) <- "seurat_clusters"
+new.cluster.ids <- c("Th0 I", "Th0 II", "Tfh", "Th0 IV", "Th0 III", "Pre-Th1 I",
+                     "Pre-Th1 proliferating", "Pre-Tfh I", "Pre-Tfh II", "Th0 V", "Th0 VI", "Th1",
+                     "Pre-Th1 II", "Unknown 1", "Pre-Tfh proliferating", "Unknown 2", "Unknown 3")
+names(new.cluster.ids) <- levels(t_cells)
+t_cells <- RenameIdents(t_cells, new.cluster.ids)
+t_cells <- AddMetaData(object = t_cells, metadata = Idents(t_cells), col.name = 'Celltype_2')
+
+t_cells@meta.data$Celltype_2 <- factor(
+  t_cells@meta.data$Celltype_2,
+  levels = c("Th0 I", "Th0 II", "Th0 III", "Th0 IV", "Th0 V", "Th0 VI",
+             "Tfh", "Pre-Tfh I", "Pre-Tfh II", "Pre-Tfh proliferating",
+             "Th1", "Pre-Th1 I", "Pre-Th1 II", "Pre-Th1 proliferating",
+             "Unknown 1", "Unknown 2", "Unknown 3"))
+
+DimPlot(t_cells, reduction = "umap", label = F, repel = TRUE, group.by = "Celltype_2", cols = celltype_colors_3) +
+  ggtitle("T cells colored by cluster")
+```
+
+```{r final-annotation-split, fig.width = 20, fig.height = 6}
+DimPlot(t_cells, reduction = "umap", group.by = 'Celltype_2', split.by = "orig.ident", cols = celltype_colors_2)
+```
+
+### QC per cell type
+
+```{r celltype-qc}
+table(t_cells@meta.data$Celltype_2)
+
+t_cells@meta.data %>%
+  group_by(Celltype_2) %>%
+  summarise(
+    n_cells = n(),
+    mean_mt = round(mean(percent.mt), 2),
+    median_mt = round(median(percent.mt), 2),
+    mean_count = round(mean(nCount_RNA), 2),
+    mean_feature = round(mean(nFeature_RNA), 2)
+  ) %>%
+  arrange(Celltype_2)  # respects factor order
+```
+
+```{r save-tcells}
+saveRDS(t_cells, file = paste0(rdata, "RDS_Tcells_annotated.rds"))
+```
+
+### Figures (without Unknowns)
+
+```{r remove-unknowns}
+cells_keep <- levels(t_cells@meta.data$Celltype_2)[
+  !levels(t_cells@meta.data$Celltype_2) %in% unknown_types
+]
+t_cells_f <- subset(t_cells, subset = Celltype_2 %in% cells_keep)
+```
+
+**Figure 2a** – UMAP of all T cells coloured by `Celltype_2`.
+
+```{r fig-umap-celltypes, fig.width = 5, fig.height = 4}
+p <- DimPlot(t_cells_f, reduction = "umap", group.by = "Celltype_2", cols = celltype_colors_3) + ggtitle("")
+p
+ggsave(plot = p, filename = paste0(fig_dir, "Fig2a_UMAP_celltypes.pdf"), width = 6, height = 4)
+```
+
+Second annotation level `Celltype_3` (all Th0 subclusters merged); the UMAPs in this and the next chunk are not in the manuscript.
+
+```{r}
+# ------------------------------------------------------------
+# Second annotation level: all Th0 subclusters merged
+# ------------------------------------------------------------
+t_cells_f@meta.data$Celltype_3 <- as.character(t_cells_f@meta.data$Celltype_2)
+t_cells_f@meta.data$Celltype_3[grepl("^Th0", t_cells_f@meta.data$Celltype_3)] <- "Th0"
+
+t_cells_f@meta.data$Celltype_3 <- factor(
+  t_cells_f@meta.data$Celltype_3,
+  levels = c("Th0",
+             "Tfh", "Pre-Tfh I", "Pre-Tfh II", "Pre-Tfh proliferating",
+             "Th1", "Pre-Th1 I", "Pre-Th1 II", "Pre-Th1 proliferating"))
+
+celltype_colors_th0 <- c(
+  "Th0" = "#238b45",
+  celltype_colors_3[!grepl("^Th0", names(celltype_colors_3))]
+)
+
+# Check
+table(t_cells_f@meta.data$Celltype_3, useNA = "ifany")
+
+p1 <-DimPlot(t_cells_f, reduction = "umap", group.by = "Celltype_3", cols = celltype_colors_th0,
+             raster = TRUE, raster.dpi = c(3000, 3000), pt.size = 9) +
+  ggtitle("T cells colored by cluster (Th0 merged)")
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "F_celltypes_mergedT0.pdf"), width = 6, height = 4)
+```
+
+```{r}
+p2 <- DimPlot(t_cells_f, reduction = "umap", group.by = "Celltype_3", cols = celltype_colors_th0,
+              split.by = "orig.ident", ncol = 2,
+              raster = TRUE, raster.dpi = c(3000, 3000), pt.size = 9) +
+  ggtitle("T cells colored by cluster (Th0 merged) across days")
+p2
+ggsave(plot = p2, filename = paste0(fig_dir, "F_celltypes_mergedT0_days.pdf"), width = 7.8, height = 5.8)
+```
+
+**Figure 2d** – relative abundance of the populations per day (`Celltype_3`, all cells).
+
+```{r fig-stacked-barplot}
+plot_df <- t_cells_f@meta.data %>%
+  dplyr::count(orig.ident, Celltype_3) %>%
+  group_by(orig.ident) %>%
+  mutate(rel_abundance = n / sum(n)) %>%
+  ungroup()
+
+p1 <- ggplot(plot_df, aes(x = orig.ident, y = rel_abundance, fill = Celltype_3)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = celltype_colors_th0) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Day", y = "Relative abundance", fill = "Celltype_3") +
+  theme_classic()
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "Fig2d_StackedBarplot_celltypes_per_day.pdf"), width = 5, height = 5)
+```
+
+**Figure 2b** – marker dot plot per population (`Celltype_3`).
+
+```{r fig-dotplot-celltypes, fig.width = 7.5, fig.height = 4.1}
+p3 <- marker_dotplot(t_cells_f, group.by = "Celltype_3") + coord_flip()
+p3
+ggsave(plot = p3, filename = paste0(fig_dir, "Fig2b_DotPlot_markers_celltypes.pdf"), width = 6.5, height = 4.8)
+```
+
+**Figure 2e** – mean expression of (pre-)Tfh and (pre-)Th1 genes per population, z-scored per gene.
+
+```{r}
+# ------------------------------------------------------------
+# Heatmap: mean expression per Celltype_3, z-scored per gene
+# ------------------------------------------------------------
+genes_tfh <- c("Zbtb20", "Slc9a9", "Arid5b", "Cd226", "Bcl6")
+genes_th1 <- c("Lyar", "Fabp5", "Cenpw", "Il2ra", "Tbx21")
+genes_hm  <- c(genes_tfh, genes_th1)
+
+# Check that all genes are present
+setdiff(genes_hm, rownames(t_cells_f))
+
+# Mean log-normalized expression per cell type
+expr <- GetAssayData(t_cells_f, slot = "data", assay = "RNA")[genes_hm, ]
+grp  <- t_cells_f@meta.data$Celltype_3
+
+avg <- sapply(levels(grp), function(ct) Matrix::rowMeans(expr[, grp == ct, drop = FALSE]))
+
+# z-score per gene across cell types
+z <- t(scale(t(avg)))
+
+hm_df <- as.data.frame(as.table(z))
+colnames(hm_df) <- c("Gene", "Celltype", "z")
+
+hm_df <- hm_df %>%
+  mutate(
+    Group = factor(ifelse(Gene %in% genes_tfh, "Up in (Pre-)Tfh", "Up in (Pre-)Th1"),
+                   levels = c("Up in (Pre-)Tfh", "Up in (Pre-)Th1")),
+    Gene = factor(Gene, levels = genes_hm),
+    Celltype = factor(Celltype, levels = rev(levels(grp)))   # first cell type on top
+  )
+
+p_hm <- ggplot(hm_df, aes(x = Gene, y = Celltype, fill = z)) +
+  geom_tile(color = "white", size = 0.3) +
+  facet_grid(~Group, scales = "free_x", space = "free_x") +
+  scale_fill_gradient2(low = "#2c4fa3", mid = "white", high = "#d6263a", midpoint = 0,
+                       name = "Z-Score") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, face = "italic", color = "black"),
+    axis.text.y = element_text(color = "black"),
+    panel.grid = element_blank(),
+    panel.spacing = unit(0, "pt"),
+    panel.border = element_rect(color = "black", fill = NA, size = 0.6),
+    strip.text = element_text(size = 10),
+    strip.background = element_rect(fill = "grey92", color = "black", size = 0.6),
+    legend.title = element_text(angle = 90, vjust = 0.5)
+  ) +
+  guides(fill = guide_colorbar(title.position = "right", barheight = unit(5, "cm")))
+p_hm
+
+ggsave(plot = p_hm, filename = paste0(fig_dir, "Fig2e_Heatmap_TfhTh1_genes_zscore.pdf"),
+       width = 5.5, height = 5.1)
+```
+
+**Supplementary Figure 2b** – marker dot plots per day (common colour and size scales).
+
+```{r fig-dotplot-by-day, fig.width = 11, fig.height = 4.5}
+days <- unique(as.character(t_cells_f$orig.ident))
+
+# 1) dot plots per day (without scales)
+dotplots_by_day <- lapply(days, function(current_day) {
+  object_day <- subset(t_cells_f, subset = orig.ident == current_day)
+  DotPlot(object_day, features = features_plot, group.by = "Celltype_3",
+          assay = "RNA", dot.scale = 6) +
+    labs(title = current_day, x = "Identity", y = "Features") +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    coord_flip()
+})
+
+# 2) common limits across days
+all_dat   <- do.call(rbind, lapply(dotplots_by_day, function(p) p$data))
+col_lim   <- range(all_dat$avg.exp.scaled, na.rm = TRUE)
+col_lim   <- c(-1, 1) * max(abs(col_lim))           # symmetric around 0
+size_lim  <- c(0, max(all_dat$pct.exp, na.rm = TRUE))
+
+# 3) identical scales for all plots
+dotplots_by_day <- lapply(dotplots_by_day, function(p) {
+  suppressMessages(
+    p +
+      scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                            limits = col_lim, space = "Lab", na.value = "grey50",
+                            name = "Average\nExpression") +
+      scale_size(limits = size_lim, range = c(0, 6), name = "Percent\nExpressed")
+  )
+})
+
+p3_by_day <- wrap_plots(dotplots_by_day, ncol = 1, guides = "collect") &
+  theme(legend.position = "right")
+p3_by_day
+
+ggsave(filename = paste0(fig_dir, "SuppFig2b_DotPlot_markers_by_day.pdf"), plot = p3_by_day,
+       width = 6.5, height = 4.2 * length(days))
+```
+
+### Day 6: Tfh vs Th1 marker dot plot (fixed scales) → Figure 6d (right part)
+
+The left part of Fig. 6d (CD62L⁻ populations, single vs dual TCR) is made in `05_TCR_CD62L_KLF2_mouse.ipynb` with the same gene panel.
+
+```{r}
+day6  <- grep("6", unique(as.character(t_cells_f$orig.ident)), value = TRUE)
+types <- c("Tfh", "Th1")
+
+cells_keep <- rownames(t_cells_f@meta.data)[
+  t_cells_f$orig.ident %in% day6 &
+  t_cells_f@meta.data$Celltype_3 %in% types
+]
+t_d6 <- subset(t_cells_f, cells = cells_keep)
+t_d6$Celltype_3 <- factor(t_d6$Celltype_3, levels = types)
+
+table(t_d6$Celltype_3)   # cell numbers
+
+# ---- fixed scales ----
+COL_LIM     <- c(-1.4, 1.4)        # avg. scaled expression (observed: -1.37 to 1.38)
+SIZE_LIM    <- c(0, 100)           # Percent Expressed
+SIZE_BREAKS <- c(20, 40, 60, 80)   # legend entries
+
+p_d6 <- DotPlot(t_d6, features = features_plot, group.by = "Celltype_3",
+                assay = "RNA", dot.scale = 6) +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                        limits = COL_LIM, oob = scales::squish,
+                        space = "Lab", na.value = "grey50",
+                        name = "Average\nExpression") +
+  scale_size_continuous(range = c(0, 6), limits = SIZE_LIM, breaks = SIZE_BREAKS,
+                        name = "Percent\nExpressed") +
+  labs(title = paste(day6, collapse = "/"), x = NULL, y = NULL) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title  = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(face = "italic")
+  ) +
+  coord_flip()
+
+p_d6
+
+# observed value ranges
+range(p_d6$data$avg.exp.scaled, na.rm = TRUE)
+range(p_d6$data$pct.exp, na.rm = TRUE)
+
+ggsave(filename = paste0(fig_dir, "Fig6d_right_DotPlot_day6_Tfh_vs_Th1.pdf"),
+       plot = p_d6, width = 3, height = 3)
+```
+
+# Module scores (proliferation & signaling)
+
+## Signatures
+
+```{r module-signatures}
+signature_names <- c(
+  E2F = "HALLMARK_E2F_TARGETS",
+  G2M = "HALLMARK_G2M_CHECKPOINT",
+  STAT3 = "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+  STAT5 = "HALLMARK_IL2_STAT5_SIGNALING",
+  IFN_ALPHA = "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+  IFN_GAMMA = "HALLMARK_INTERFERON_GAMMA_RESPONSE",
+  Stemness = "RAMALHO_STEMNESS_UP",
+  Cytokine_production = "GOBP_T_CELL_CYTOKINE_PRODUCTION",
+  Cytokine_production_immune = "GOBP_CYTOKINE_PRODUCTION_INVOLVED_IN_IMMUNE_RESPONSE",
+  Apoptosis = "HALLMARK_APOPTOSIS",
+  Secretion = "HALLMARK_PROTEIN_SECRETION",
+  TCR_Signaling = "REACTOME_TCR_SIGNALING",
+  Cytokine_activity = "GOMF_CYTOKINE_ACTIVITY",
+  Chemokine_activity = "GOMF_CHEMOKINE_ACTIVITY"
+)
+
+# Mouse MSigDB gene sets
+msigdb_mouse <- msigdbr(species = "Mus musculus")
+signature_df <- msigdb_mouse %>% filter(gs_name %in% signature_names)
+table(signature_df$gs_name)
+
+# Custom Tmem signature
+custom_signature <- c(
+  "Btg1", "Ccnd2", "Eif4a2", "Gm10073", "Il7r", "Malat1", "Rabac1",
+  "Rpl12", "Rpl13", "Rpl13-ps3", "Rpl18a", "Rpl36", "Rpl36a", "Rpl37a", "Rpl38",
+  "Rpl9", "Rpl9-ps6", "Rplp1", "Rplp2",
+  "Rps14", "Rps15", "Rps15a", "Rps16", "Rps19", "Rps21",
+  "Rps23",      # changed from Ros23 - please check original
+  "Rps24", "Rps27", "Rps27rt", "Rps28", "Rps29", "Rps5", "Rps9"
+)
+# Gene lists per signature
+signature_genes <- lapply(signature_names, function(sig) {
+  signature_df %>% filter(gs_name == sig) %>% pull(gene_symbol) %>% unique()
+})
+names(signature_genes) <- names(signature_names)
+signature_genes[["Tmem_signature"]] <- custom_signature
+
+
+# Custom cytokine signature
+cytokine_signature <- unique(c(
+  "Amh", "Artn", "Bdnf", "Bmp10", "Bmp15", "Bmp2", "Bmp5", "Bmp6", "Bmp8a", "Bmp8b",
+  "C3", "Ccbp2",
+  "Ccl1", "Ccl11", "Ccl12", "Ccl17", "Ccl19", "Ccl2", "Ccl20", "Ccl21a", "Ccl21b", "Ccl21c",
+  "Ccl22", "Ccl24", "Ccl25", "Ccl26", "Ccl27a", "Ccl28", "Ccl3", "Ccl4", "Ccl5", "Ccl6",
+  "Ccl7", "Ccl8", "Ccl9",
+  "Cga", "Cish", "Cklf", "Clcf1", "Cmtm1", "Cmtm3", "Cmtm4", "Cmtm5", "Cntf",
+  "Csf1", "Csf2", "Csf3", "Ctf1", "Cx3cl1",
+  "Cxcl1", "Cxcl10", "Cxcl11", "Cxcl12", "Cxcl13", "Cxcl14", "Cxcl15", "Cxcl16", "Cxcl17",
+  "Cxcl2", "Cxcl3", "Cxcl5", "Cxcl9",
+  "Cytl1", "Dock2", "Epo",
+  "Fgf1", "Fgf10", "Fgf11", "Fgf12", "Fgf13", "Fgf14", "Fgf16", "Fgf17", "Fgf18", "Fgf2",
+  "Fgf20", "Fgf21", "Fgf22", "Fgf23", "Fgf3", "Fgf4", "Fgf5", "Fgf6", "Fgf7", "Fgf8", "Fgf9",
+  "Figf", "Fshb",
+  "Gdf1", "Gdf10", "Gdf11", "Gdf15", "Gdf2", "Gdf3", "Gdf5", "Gdf6", "Gdf7", "Gdf9", "Gdnf",
+  "Gh", "Gpha2", "Gphb5",
+  "Ifna1", "Ifna11", "Ifna12", "Ifna13", "Ifna14", "Ifna2", "Ifna4", "Ifna5", "Ifna6",
+  "Ifna7", "Ifna9", "Ifnab", "Ifnb1", "Ifne", "Ifng", "Ifnk", "Ifnz",
+  "Il10", "Il11", "Il12a", "Il12b", "Il13", "Il15", "Il16", "Il17a", "Il17b", "Il17c",
+  "Il17d", "Il17f", "Il18", "Il19", "Il1a", "Il1b", "Il1f10", "Il1f5", "Il1f6", "Il1f8",
+  "Il1f9", "Il1rn", "Il2", "Il20", "Il21", "Il22", "Il23a", "Il24", "Il25", "Il27",
+  "Il28a", "Il28b", "Il3", "Il31", "Il33", "Il34", "Il4", "Il5", "Il6", "Il6st", "Il7", "Il9",
+  "Inha", "Inhba", "Inhbb", "Inhbc", "Inhbe",
+  "Kitl", "Lefty1", "Lefty2", "Lep", "Lhb", "Lif", "Mstn", "Ngf", "Nodal", "Nrtn",
+  "Ntf3", "Ntf5", "Osm",
+  "Pdgfa", "Pdgfb", "Pdgfc", "Pdgfd", "Pf4", "Pgf", "Pomc", "Ppbp", "Prl", "Pspn",
+  "Socs1", "Socs2", "Socs3", "Socs4", "Socs5", "Socs6", "Socs7",
+  "Tgfb1", "Tgfb2", "Tgfb3", "Thpo", "Tnf",
+  "Tnfsf10", "Tnfsf11", "Tnfsf12", "Tnfsf13", "Tnfsf13b", "Tnfsf14", "Tnfsf15",
+  "Tnfsf18", "Tnfsf4", "Tnfsf8", "Tnfsf9",
+  "Tshb", "Vegfa", "Vegfb", "Vegfc", "Xcl1"
+))
+
+# Custom cytokine receptor signature
+receptor_signature <- unique(c(
+  "Bcap31", "C3ar1", "C5ar1", "Cd200r1", "Cd200r2", "Cd244", "Cd247", "Cd27", "Cd300lf",
+  "Clec12a", "Cr1l", "Cr2", "Csf1r", "Csf2ra", "Csf2rb", "Csf3r", "Cxcr6", "Cysltr1",
+  "Ddr1", "Fas", "Fcamr", "Fcer1a", "Fcer1g", "Fcgr2b", "Fcgrt", "Fcrl5", "Fcrla",
+  "Fgfr1", "Fgfr2", "Fgfr3", "Fgfr4", "Hmmr", "Hrh2", "Hrh4",
+  "Ifnar2", "Ifngr1", "Ifngr2", "Igf1r", "Igf2r",
+  "Il10ra", "Il10rb", "Il12rb1", "Il12rb2", "Il13ra1", "Il13ra2", "Il15ra",
+  "Il17ra", "Il17rb", "Il17rc", "Il17rd", "Il17re", "Il18r1", "Il18rap",
+  "Il1r1", "Il1r2", "Il1rap", "Il1rapl1", "Il1rapl2", "Il1rl1", "Il1rl2",
+  "Il20ra", "Il21r", "Il22ra1", "Il23r", "Il28ra", "Il2ra", "Il2rb", "Il2rg",
+  "Il31ra", "Il3ra", "Il5ra", "Il7r", "Il9r",
+  "Insr", "Irak1", "Irak1bp1", "Irak2", "Irak3", "Irak4", "Kdr", "Kir3dl1", "Kir3dl2",
+  "Klrb1", "Klrc1", "Klrc2", "Klrd1", "Lair1", "Lifr", "Lilra5", "Lilra6", "Lilrb3", "Lilrb4",
+  "Ltb4r2", "Ltbr", "Marco", "Mrc1", "Mrc2", "Msr1", "Mst1r", "Ncr1",
+  "Pilra", "Pla2r1", "Plaur", "Procr", "Ptafr", "Ptgfrn", "Ptpn22", "Ptprc", "Ptprcap",
+  "Ptprj", "Pvr", "Pvrl1", "Pvrl2", "Ripk1", "Scarb1", "Slamf6", "Tfrc",
+  "Tlr1", "Tlr2", "Tlr4", "Tlr5",
+  "Tnfrsf10b", "Tnfrsf11a", "Tnfrsf12a", "Tnfrsf13b", "Tnfrsf13c", "Tnfrsf14",
+  "Tnfrsf17", "Tnfrsf18", "Tnfrsf1a", "Tnfrsf1b", "Tnfrsf4", "Tnfrsf8", "Tnfrsf9",
+  "Traf1", "Traf2", "Traf3", "Traf3ip1", "Traf5", "Traf6"
+))
+
+signature_genes[["Cytokines"]] <- cytokine_signature
+signature_genes[["Cytokine_receptors"]] <- receptor_signature
+
+
+sapply(signature_genes, length)
+
+```
+
+```{r module-genes-present}
+DefaultAssay(t_cells) <- "RNA"
+
+min_pct_expressed <- 0.05
+
+expr_matrix <- GetAssayData(t_cells, layer = "counts", assay = "RNA")
+expr_bin <- expr_matrix > 0
+
+# Fraction of expressing cells per cell type
+cells_by_type <- split(colnames(t_cells), t_cells$Celltype_2)
+cells_by_type <- cells_by_type[names(cells_by_type) %in% cluster_order]
+
+pct_by_type <- sapply(cells_by_type, function(cells) Matrix::rowMeans(expr_bin[, cells, drop = FALSE]))
+
+# Keep genes expressed in >= 5% of cells in at least one cell type
+genes_expressed <- rownames(pct_by_type)[apply(pct_by_type, 1, max) >= min_pct_expressed]
+
+signature_genes_present <- lapply(signature_genes, function(genes) intersect(genes, genes_expressed))
+
+data.frame(
+  signature = names(signature_genes),
+  n_original = sapply(signature_genes, length),
+  n_in_object = sapply(signature_genes, function(g) length(intersect(g, rownames(t_cells)))),
+  n_used = sapply(signature_genes_present, length)
+)
+
+# Safety: AddModuleScore fails on empty signatures
+empty_signatures <- names(signature_genes_present)[sapply(signature_genes_present, length) == 0]
+if (length(empty_signatures) > 0) {
+  warning("No genes left after filtering, signature removed: ",
+          paste(empty_signatures, collapse = ", "))
+  signature_genes_present <- signature_genes_present[!names(signature_genes_present) %in% empty_signatures]
+}
+
+```
+
+## Module scores
+
+```{r module-scores}
+for (sig in names(signature_genes_present)) {
+  t_cells <- AddModuleScore(
+    object = t_cells,
+    features = list(signature_genes_present[[sig]]),
+    name = paste0(sig, "_score"),
+    assay = "RNA"
+  )
+}
+
+score_columns <- c(
+  "E2F_score1", "G2M_score1", "STAT3_score1", "STAT5_score1",
+  "IFN_ALPHA_score1", "IFN_GAMMA_score1", "Cytokine_production_score1", "TCR_Signaling_score1","Secretion_score1", "Cytokines_score1", "Cytokine_receptors_score1", "Cytokine_activity_score1", "Chemokine_activity_score1"
+)
+
+signature_order <- c(
+  "E2F targets", "G2/M checkpoint", "IL-6/JAK/STAT3", "IL-2/STAT5",
+  "IFN alpha","IFN gamma", "Cytokine production", "TCR Signaling","Secretion", "Cytokines", "Cytokine receptors", "Cytokine activity", "Chemokine activity"
+)
+
+celltype_order <- c(
+  "Th0 I", "Th0 II", "Th0 III", "Th0 IV", "Th0 V", "Th0 VI",
+  "Tfh", "Pre-Tfh I", "Pre-Tfh II", "Pre-Tfh proliferating",
+  "Th1", "Pre-Th1 I", "Pre-Th1 II", "Pre-Th1 proliferating"
+)
+```
+
+## Module scores per cell type
+
+```{r module-plotdata-celltype}
+plot_df <- t_cells@meta.data %>%
+  select(Celltype_2, all_of(score_columns)) %>%
+  # IMPORTANT: convert factor to character first
+  mutate(Celltype_2 = as.character(Celltype_2)) %>%
+  filter(!is.na(Celltype_2), !Celltype_2 %in% unknown_types) %>%
+  pivot_longer(cols = all_of(score_columns), names_to = "signature", values_to = "score") %>%
+  mutate(
+    signature = recode(
+      signature,
+      E2F_score1 = "E2F targets",
+      G2M_score1 = "G2/M checkpoint",
+      STAT3_score1 = "IL-6/JAK/STAT3",
+      STAT5_score1 = "IL-2/STAT5",
+      IFN_ALPHA_score1 = "IFN alpha",
+      IFN_GAMMA_score1 = "IFN gamma",
+      Cytokine_production_score1 = "Cytokine production",
+      TCR_Signaling_score1 = "TCR Signaling",
+     Secretion_score1 = "Secretion",
+      Cytokines_score1 = "Cytokines",
+      Cytokine_receptors_score1 = "Cytokine receptors",
+      Cytokine_activity_score1 = "Cytokine activity",
+      Chemokine_activity_score1 = "Chemokine activity"
+    ),
+    signature = factor(signature, levels = signature_order),
+    # Restore Celltype_2 as factor AFTER filtering
+    Celltype_2 = factor(Celltype_2, levels = celltype_order)
+  ) %>%
+  filter(!is.na(score))
+
+head(plot_df)
+table(plot_df$Celltype_2, plot_df$signature)
+```
+
+```{r module-boxplots-celltype}
+p1 <- ggplot(plot_df, aes(x = Celltype_2, y = score, fill = Celltype_2)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  scale_fill_manual(values = celltype_colors_3) +
+  facet_wrap(~signature, scales = "free_y", ncol = 1) +
+  theme_classic() +
+  labs(x = "Cell type", y = "Module score") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+p1
+ggsave(filename = paste0(fig_dir, "Tcell_module_scores.pdf"), plot = p1,
+       width = 5, height = 9, units = "in", device = cairo_pdf)
+```
+
+## Module scores per grouped cell type
+
+```{r module-plotdata-grouped}
+plot_df <- t_cells@meta.data %>%
+  select(Celltype_2, all_of(score_columns)) %>%
+  mutate(Celltype_2 = as.character(Celltype_2)) %>%
+  filter(!is.na(Celltype_2), !Celltype_2 %in% unknown_types) %>%
+  # Collapse internal subclusters
+  mutate(
+    Celltype_grouped = case_when(
+      Celltype_2 %in% c("Th0 I", "Th0 II", "Th0 III", "Th0 IV", "Th0 V", "Th0 VI") ~ "Th0",
+      Celltype_2 %in% c("Pre-Tfh I", "Pre-Tfh II") ~ "Pre-Tfh",
+      Celltype_2 == "Pre-Tfh proliferating" ~ "Pre-Tfh proliferating",
+      Celltype_2 == "Tfh" ~ "Tfh",
+      Celltype_2 %in% c("Pre-Th1 I", "Pre-Th1 II") ~ "Pre-Th1",
+      Celltype_2 == "Pre-Th1 proliferating" ~ "Pre-Th1 proliferating",
+      Celltype_2 == "Th1" ~ "Th1",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(Celltype_grouped)) %>%
+  pivot_longer(cols = all_of(score_columns), names_to = "signature", values_to = "score") %>%
+  mutate(
+    signature = recode(
+      signature,
+      E2F_score1 = "E2F targets",
+      G2M_score1 = "G2/M checkpoint",
+      STAT3_score1 = "IL-6/JAK/STAT3",
+      STAT5_score1 = "IL-2/STAT5",
+      IFN_ALPHA_score1 = "IFN alpha",
+      IFN_GAMMA_score1 = "IFN gamma",
+      Cytokine_production_score1 = "Cytokine production",
+      TCR_Signaling_score1 = "TCR Signaling",
+      Secretion_score1 = "Secretion",
+      Cytokines_score1 = "Cytokines",
+      Cytokine_receptors_score1 = "Cytokine receptors",
+      Cytokine_activity_score1 = "Cytokine activity",
+      Chemokine_activity_score1 = "Chemokine activity"
+    ),
+    signature = factor(signature, levels = signature_order),
+    Celltype_grouped = factor(Celltype_grouped, levels = celltype_grouped_order)
+  ) %>%
+  filter(!is.na(score))
+
+# QC
+head(plot_df)
+table(plot_df$Celltype_grouped, plot_df$signature)
+levels(plot_df$Celltype_grouped)
+levels(plot_df$signature)
+```
+
+```{r module-boxplots-grouped}
+p1 <- ggplot(plot_df, aes(x = Celltype_grouped, y = score, fill = Celltype_grouped)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  scale_fill_manual(values = celltype_colors_grouped) +
+  facet_wrap(~signature, scales = "free_y", ncol = 1) +
+  theme_classic() +
+  labs(x = "Cell type", y = "Module score") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+p1
+ggsave(filename = paste0(fig_dir, "Tcell_module_scores_grouped.pdf"), plot = p1,
+       width = 3, height = 9, units = "in", device = cairo_pdf)
+```
+
+```{r}
+# ------------------------------------------------------------
+# Small plot: cell cycle + cytokine-related signatures
+# ------------------------------------------------------------
+small_signatures <- c(
+  "E2F targets",
+  "G2/M checkpoint",
+  "Cytokine production",
+  "Cytokine activity",
+  "IL-2/STAT5",
+  "IL-6/JAK/STAT3", "IFN alpha", "IFN gamma"
+)
+
+plot_df_small <- plot_df %>%
+  filter(signature %in% small_signatures) %>%
+  mutate(signature = factor(signature, levels = small_signatures))
+
+p2 <- ggplot(plot_df_small, aes(x = Celltype_grouped, y = score, fill = Celltype_grouped)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  scale_fill_manual(values = celltype_colors_grouped) +
+  facet_wrap(~signature, scales = "free_y", ncol = 2) +
+  theme_classic() +
+  labs(x = "Cell type", y = "Module score") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+p2
+ggsave(filename = paste0(fig_dir, "Tcell_module_scores_grouped_cellcycle_cytokines.pdf"), plot = p2,
+       width = 5, height = 0.5 * length(small_signatures) + 1.2, units = "in", device = cairo_pdf)
+```
+
+**Figure 3a** – module scores (z-standardised) per grouped population (boxplots, second plot of this chunk). The boxplots on the raw scale above and the z-score heatmap are not in the manuscript.
+
+```{r module-scores-zscore, fig.width = 5, fig.height = 4}
+# ============================================================
+# z-standardize each module score across all cells
+# (per signature: mean 0, SD 1) -> comparable relative differences
+# ============================================================
+
+plot_df_z <- plot_df %>%filter(signature %in% small_signatures) %>% mutate(signature = factor(signature, levels = small_signatures)) %>%
+  group_by(signature) %>%
+  mutate(z = (score - mean(score)) / sd(score)) %>%
+  ungroup()
+
+# ------------------------------------------------------------
+# 1. Heatmap: mean z-score per grouped cell type
+# ------------------------------------------------------------
+heat_df <- plot_df_z %>%
+  group_by(signature, Celltype_grouped) %>%
+  summarise(mean_z = mean(z), .groups = "drop")
+
+p_heat <- ggplot(heat_df, aes(x = Celltype_grouped, y = signature, fill = mean_z)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", mean_z)), size = 2.5) +
+  scale_fill_gradient2(low = "#2166ac", mid = "white", high = "#b2182b", midpoint = 0,
+                       name = "Mean z-score") +
+  scale_y_discrete(limits = rev(levels(heat_df$signature))) +
+  labs(x = NULL, y = NULL) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_heat
+
+ggsave(filename = paste0(fig_dir, "Tcell_module_scores_zscore_heatmap.pdf"), plot = p_heat,
+       width = 4, height = 3, units = "in", device = cairo_pdf)
+
+# ------------------------------------------------------------
+# 2. Boxplots on a common z-scale (fixed y-axis across panels)
+# ------------------------------------------------------------
+p_z <- ggplot(plot_df_z, aes(x = Celltype_grouped, y = z, fill = Celltype_grouped)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey60", linewidth = 0.1) +
+  geom_boxplot(outlier.shape = NA, width = 0.7, size = 0.2,          # outline + whiskers thinner (default ~0.5)
+               fatten = 1.5) +
+  scale_fill_manual(values = celltype_colors_grouped) +
+  coord_cartesian(ylim = c(-2, 3)) +
+  facet_wrap(~signature, ncol = 2) +
+  theme_classic(base_size = 8) +
+  labs(x = "Cell type", y = "Module score (z)") +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.line = element_line(size = 0.25),
+    axis.ticks = element_line(size = 0.25),
+    axis.ticks.length = unit(1.5, "pt"),
+    legend.position = "none",
+    strip.background = element_blank(),
+    strip.text = element_text()
+  )
+
+ggsave(filename = paste0(fig_dir, "Fig3a_Tcell_module_scores_grouped_zscore.pdf"), plot = p_z,
+       width = 2.5, height = 0.3 * nlevels(plot_df_z$signature) + 1.2,
+       units = "in", device = cairo_pdf)
+```
+
+# Downsampling of T cells
+
+Day 0 contributes far more cells than the other days. For the composition plots every day is therefore randomly downsampled to the size of the smallest sample (Day 2, 3,091 cells).
+
+```{r plot-dsimmune, fig.width = 5, fig.cap = "UMAP of the downsampled T cells"}
+set.seed(123)
+smallest_sample <- t_cells@meta.data$orig.ident %>% table()
+barcodes <- t_cells@meta.data %>%
+  rownames_to_column('Barcodes') %>%
+  group_by(orig.ident) %>%
+  slice_sample(n = min(smallest_sample)) %>%
+  pull(Barcodes)
+
+downsampleData <- subset(t_cells, cells = barcodes)
+DimPlot(downsampleData, reduction = "umap", group.by = "integrated_snn_res.0.8")
+```
+
+## Contribution of each sampling day across clusters
+
+```{r plot-barplot, fig.height = 4, fig.width = 9, fig.cap = "Downsampled T cells per Seurat cluster"}
+ggplot(downsampleData@meta.data, aes(x = integrated_snn_res.0.8, fill = orig.ident)) +
+  geom_bar() +
+  geom_text(stat = 'count', aes(label = ..count..), position = position_stack(vjust = 0.5), size = 3) +
+  ylab('Number of cells') +
+  scale_fill_manual(values = color_vector_samples) +
+  theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    legend.text = element_text(size = 10),
+    text = element_text(size = 12),
+    legend.title = element_blank(),
+    axis.title.x = element_blank()) +
+  RotatedAxis()
+```
+
+```{r plot-barplot2, fig.height = 4, fig.width = 9, fig.cap = "Downsampled T cells per cell type"}
+ggplot(downsampleData@meta.data, aes(x = Celltype_2, fill = orig.ident)) +
+  geom_bar(position = position_dodge()) +
+  ylab('Number of cells') +
+  scale_fill_manual(values = color_vector_samples) +
+  theme_classic() +
+  theme(
+    panel.grid = element_blank(),
+    legend.text = element_text(size = 10),
+    text = element_text(size = 12),
+    legend.title = element_blank(),
+    axis.title.x = element_blank()) +
+  RotatedAxis()
+```
+
+Cell numbers per cluster and day:
+
+```{r cell-numbers-as-table}
+downsampleData@meta.data %>%
+  dplyr::group_by(seurat_clusters) %>%
+  dplyr::count(orig.ident) %>%
+  set_colnames(c("Seurat clusters", "Sampling Day", "Number of cells"))
+```
+
+## Cell types across days
+
+**Figure 2c** – UMAP per day, every day downsampled to the smallest sample, Unknowns removed.
+
+```{r ds-celltypes-days-all, fig.width = 7, fig.height = 6}
+downsampleData_noUKN <- subset(downsampleData, subset = !(Celltype_2 %in% unknown_types))
+downsampleData_noUKN$Celltype_2 <- droplevels(downsampleData_noUKN$Celltype_2)
+
+p <- DimPlot(downsampleData_noUKN, reduction = "umap", group.by = "Celltype_2", cols = celltype_colors_3,
+             split.by = "orig.ident", ncol = 2) + ggtitle("Celltypes across Days")
+p
+ggsave(plot = p, filename = paste0(fig_dir, "Fig2c_UMAP_celltypes_per_day_downsampled.pdf"), width = 7, height = 6)
+```
+
+```{r ds-celltypes-days, fig.width = 7, fig.height = 6}
+cells_keep <- levels(downsampleData@meta.data$Celltype_2)[
+  !levels(downsampleData@meta.data$Celltype_2) %in% unknown_types
+]
+
+# Unknowns and Day 0 removed (plots of this and the following chunks are not in the manuscript)
+downsampleData_filtered <- subset(
+  downsampleData,
+  subset = Celltype_2 %in% cells_keep & orig.ident != "Day0"
+)
+
+p <- DimPlot(downsampleData_filtered, reduction = "umap", group.by = "Celltype_2",
+             cols = celltype_colors_3, split.by = "orig.ident", ncol = 2) +
+  ggtitle("Celltypes across Days")
+p
+ggsave(plot = p, filename = paste0(fig_dir, "F_DS_celltypes_days.pdf"), width = 7, height = 6)
+```
+
+```{r ds-clusters-days, fig.width = 7, fig.height = 6}
+p <- DimPlot(downsampleData_filtered, reduction = "umap", group.by = "integrated_snn_res.0.8",
+             split.by = "orig.ident", ncol = 2) + ggtitle("Clusters across Days")
+p
+ggsave(plot = p, filename = paste0(fig_dir, "F_DS_seurat_days.pdf"), width = 7, height = 6)
+```
+
+```{r ds-celltypes, fig.width = 5, fig.height = 4}
+p <- DimPlot(downsampleData_filtered, reduction = "umap", group.by = "Celltype_2", cols = celltype_colors_3) + ggtitle("")
+p
+ggsave(plot = p, filename = paste0(fig_dir, "F_DS_celltypes.pdf"), width = 6, height = 4)
+```
+
+```{r ds-heatmap-counts, fig.height = 3, fig.width = 8}
+count_heatmap <- function(meta) {
+  meta %>%
+    group_by(Celltype_2, orig.ident) %>%
+    summarise(cell_count = n()) %>%
+    ungroup() %>%
+    ggplot(aes(x = Celltype_2, y = orig.ident, fill = cell_count)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = cell_count), color = "black", size = 3) +
+    scale_fill_gradient(low = "white", high = "red", name = "Cell count") +
+    ylab('Days') +
+    xlab('Celltype') +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank(),
+      legend.text = element_text(size = 10),
+      text = element_text(size = 12),
+      legend.title = element_blank()
+    )
+}
+
+# Without Unknowns
+p1 <- count_heatmap(downsampleData_filtered@meta.data)
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "F_HM_celltypes_DS.pdf"), width = 8, height = 3)
+
+# With Unknowns
+p1 <- count_heatmap(downsampleData@meta.data)
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "F_HM_celltypes_DS_withUKN.pdf"), width = 8, height = 3)
+```
+
+```{r ds-stacked-barplot}
+plot_df <- downsampleData_filtered@meta.data %>%
+  dplyr::count(orig.ident, Celltype_2) %>%
+  group_by(orig.ident) %>%
+  mutate(rel_abundance = n / sum(n)) %>%
+  ungroup()
+
+p1 <- ggplot(plot_df, aes(x = orig.ident, y = rel_abundance, fill = Celltype_2)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = celltype_colors_3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(x = "Day", y = "Relative abundance", fill = "Celltype_2") +
+  theme_classic()
+
+ggsave(plot = p1, filename = paste0(fig_dir, "F_celltypes_barplot.pdf"), width = 5, height = 4.5)
+```
+
+# Tfh / Th1 / T0 signature enrichment (ORA)
+
+## Signatures from the data (Celltype_2)
+
+```{r ora-universe}
+# Genes expressed in >= 5% of all T cells
+min.cells <- round(dim(t_cells@meta.data)[1] * 0.05, 0)
+normalized_matrix <- GetAssayData(t_cells, layer = "counts", assay = "RNA")
+t_cells2 <- subset(t_cells,
+                   features = rownames(normalized_matrix)[Matrix::rowSums(normalized_matrix > 0) >= min.cells])
+universe <- rownames(t_cells2@assays$RNA)
+```
+
+```{r ora-signature-markers}
+t_cells2@meta.data$Day_Celltype <- paste0(t_cells2@meta.data$orig.ident, "_", t_cells2@meta.data$Celltype_2)
+Idents(t_cells2) <- "Day_Celltype"
+DefaultAssay(t_cells2) <- "RNA"
+signature.th1_day6 <- FindMarkers(t_cells2, ident.1 = "Day6_Th1")
+signature.tfh_day6 <- FindMarkers(t_cells2, ident.1 = "Day6_Tfh")
+
+Idents(t_cells2) <- "orig.ident"
+signature.t0_day0 <- FindMarkers(t_cells2, ident.1 = "Day0")
+
+# Signatures: log2FC > 1, adj. P <= 0.05
+tfh_signature <- extract_signature(signature.tfh_day6)
+th1_signature <- extract_signature(signature.th1_day6)
+t0_signature  <- extract_signature(signature.t0_day0)
+
+tfh_signature %>% write.csv(paste0(table_dir, "Tfh_signature_Celltype2.csv"))
+th1_signature %>% write.csv(paste0(table_dir, "Th1_signature_Celltype2.csv"))
+t0_signature %>% write.csv(paste0(table_dir, "T0_signature_Celltype2.csv"))
+
+length(tfh_signature)
+length(th1_signature)
+length(t0_signature)
+```
+
+## ORA across all days
+
+```{r ora-all-days}
+Idents(t_cells2) <- "Celltype_2"
+DefaultAssay(t_cells2) <- "RNA"
+signature.cell.markers <- FindAllMarkers(t_cells2, only.pos = TRUE)
+
+gene_universe <- rownames(t_cells2@assays$RNA)
+
+degs_filtered <- signature.cell.markers %>%
+  filter(p_val_adj < 0.1) %>%
+  filter(gene %in% gene_universe)
+
+ora_results_tfh <- run_ora_unrestricted(degs_filtered, tfh_signature, gene_universe, "Tfh")
+ora_results_th1 <- run_ora_unrestricted(degs_filtered, th1_signature, gene_universe, "Th1")
+ora_results_t0  <- run_ora_unrestricted(degs_filtered, t0_signature, gene_universe, "T0")
+
+print(ora_results_tfh)
+print(ora_results_th1)
+print(ora_results_t0)
+
+combined_ora <- rbind(ora_results_tfh, ora_results_th1, ora_results_t0)
+```
+
+```{r ora-heatmap-all, fig.height = 3}
+heatmap_data <- combined_ora %>%
+  dplyr::select(cluster, p_adj, odds_ratio, Type) %>%
+  tidyr::complete(cluster, Type) %>%
+  mutate(
+    Type = factor(Type, levels = c("T0", "Tfh", "Th1")),
+    p_bin = bin_padj(p_adj)
+  )
+
+p1 <- ggplot(heatmap_data, aes(x = cluster, y = Type, fill = p_bin)) +
+  geom_tile(color = "black", linewidth = 0.3) +
+  padj_fill_scale() +
+  labs(title = "Signature enrichment", x = "Seurat cluster", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "F_Enrichment_full_filtered.pdf"), width = 7, height = 3)
+```
+
+```{r ora-heatmap-no-unknowns, fig.height = 3}
+heatmap_data <- combined_ora %>%
+  mutate(cluster = as.character(cluster)) %>%
+  filter(!cluster %in% unknown_types) %>%
+  dplyr::select(cluster, p_adj, odds_ratio, Type) %>%
+  tidyr::complete(cluster, Type) %>%
+  mutate(
+    cluster = factor(cluster, levels = cluster_order),
+    Type = factor(Type, levels = c("T0", "Tfh", "Th1")),
+    p_bin = bin_padj(p_adj)
+  )
+
+p1 <- ggplot(heatmap_data, aes(x = cluster, y = Type, fill = p_bin)) +
+  geom_tile(color = "black", linewidth = 0.3) +
+  padj_fill_scale() +
+  labs(title = "Signature enrichment", x = "Celltypes", y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p1
+ggsave(plot = p1, filename = paste0(fig_dir, "F_Enrichment_full_filtered_subset.pdf"), width = 7, height = 3)
+```
+
+## ORA per day
+
+```{r run-all-days, message=TRUE, warning=FALSE}
+days_to_analyze <- c("Day0", "Day2", "Day4", "Day6")
+
+ora_by_day <- setNames(
+  lapply(days_to_analyze, function(day_name) {
+    analyze_day(
+      seurat_object = t_cells2,
+      day_name = day_name,
+      tfh_signature = tfh_signature,
+      th1_signature = th1_signature,
+      t0_signature = t0_signature,
+      cluster_order = cluster_order
+    )
+  }),
+  days_to_analyze
+)
+```
+
+```{r show-heatmaps, fig.width=7, fig.height=3}
+ora_by_day$Day0$plot
+ora_by_day$Day2$plot
+ora_by_day$Day4$plot
+ora_by_day$Day6$plot
+```
+
+```{r inspect-results}
+ora_by_day$Day0$combined_ora
+ora_by_day$Day2$combined_ora
+ora_by_day$Day4$combined_ora
+ora_by_day$Day6$combined_ora
+```
+
+```{r combine-days}
+combined_ora_all_days <- bind_rows(
+  lapply(names(ora_by_day), function(day_name) {
+    ora_by_day[[day_name]]$combined_ora %>% mutate(day = day_name)
+  })
+) %>%
+  mutate(
+    day = factor(day, levels = days_to_analyze),
+    cluster = factor(as.character(cluster), levels = cluster_order),
+    Type = factor(Type, levels = c("T0", "Tfh", "Th1"))
+  )
+
+head(combined_ora_all_days)
+```
+
+```{r cell-numbers}
+# QC: number of cells per Celltype_2 per day
+t_cells2@meta.data %>%
+  filter(orig.ident %in% days_to_analyze) %>%
+  filter(!is.na(Celltype_2)) %>%
+  filter(!Celltype_2 %in% unknown_types) %>%
+  count(orig.ident, Celltype_2, name = "n_cells") %>%
+  mutate(Celltype_2 = factor(Celltype_2, levels = cluster_order)) %>%
+  arrange(orig.ident, Celltype_2)
+```
+
+## ORA on grouped populations
+
+```{r grouped-annotation}
+t_cells$Celltype_grouped <- case_when(
+  t_cells$Celltype_2 %in% c("Th0 I", "Th0 II", "Th0 III", "Th0 IV", "Th0 V", "Th0 VI") ~ "Th0",
+  t_cells$Celltype_2 %in% c("Pre-Tfh I", "Pre-Tfh II") ~ "Pre-Tfh",
+  t_cells$Celltype_2 == "Pre-Tfh proliferating" ~ "Pre-Tfh proliferating",
+  t_cells$Celltype_2 == "Tfh" ~ "Tfh",
+  t_cells$Celltype_2 %in% c("Pre-Th1 I", "Pre-Th1 II") ~ "Pre-Th1",
+  t_cells$Celltype_2 == "Pre-Th1 proliferating" ~ "Pre-Th1 proliferating",
+  t_cells$Celltype_2 == "Th1" ~ "Th1",
+  TRUE ~ NA_character_
+)
+
+t_cells$Celltype_grouped <- factor(t_cells$Celltype_grouped, levels = celltype_levels)
+
+# Check annotations
+table(t_cells$Celltype_grouped, useNA = "ifany")
+
+# Check which annotations were not grouped (should only be Unknowns)
+unique(t_cells$Celltype_2[is.na(t_cells$Celltype_grouped)])
+```
+
+```{r grouped-universe}
+# Genes expressed in >= 5% of all T cells
+DefaultAssay(t_cells) <- "RNA"
+
+min.cells <- round(dim(t_cells@meta.data)[1] * 0.05, 0)
+normalized_matrix <- GetAssayData(t_cells, layer = "counts", assay = "RNA")
+t_cells2 <- subset(t_cells,
+                   features = rownames(normalized_matrix)[Matrix::rowSums(normalized_matrix > 0) >= min.cells])
+universe <- rownames(t_cells2@assays$RNA)
+
+cat("Cells:", ncol(t_cells2), "\n")
+cat("Genes retained:", length(universe), "\n")
+```
+
+```{r grouped-signatures}
+t_cells2$Day_Celltype <- paste0(t_cells2$orig.ident, "_", t_cells2$Celltype_grouped)
+DefaultAssay(t_cells2) <- "RNA"
+
+# Day 6 Tfh and Th1 signatures
+Idents(t_cells2) <- "Day_Celltype"
+signature.tfh_day6 <- FindMarkers(t_cells2, ident.1 = "Day6_Tfh", only.pos = TRUE)
+signature.th1_day6 <- FindMarkers(t_cells2, ident.1 = "Day6_Th1", only.pos = TRUE)
+
+# Day 0 signature
+Idents(t_cells2) <- "orig.ident"
+signature.t0_day0 <- FindMarkers(t_cells2, ident.1 = "Day0", only.pos = TRUE)
+
+# Extract signatures, restricted to the tested gene universe
+tfh_signature <- intersect(extract_signature(signature.tfh_day6), universe)
+th1_signature <- intersect(extract_signature(signature.th1_day6), universe)
+t0_signature  <- intersect(extract_signature(signature.t0_day0), universe)
+
+# Export
+write.csv(data.frame(Gene = tfh_signature), paste0(table_dir, "Tfh_signature.csv"), row.names = FALSE)
+write.csv(data.frame(Gene = th1_signature), paste0(table_dir, "Th1_signature.csv"), row.names = FALSE)
+write.csv(data.frame(Gene = t0_signature), paste0(table_dir, "T0_signature.csv"), row.names = FALSE)
+
+data.frame(
+  Signature = c("Tfh", "Th1", "T0"),
+  N_genes = c(length(tfh_signature), length(th1_signature), length(t0_signature))
+)
+```
+
+```{r grouped-markers}
+Idents(t_cells2) <- "Celltype_grouped"
+DefaultAssay(t_cells2) <- "RNA"
+
+signature.cell.markers <- FindAllMarkers(t_cells2, only.pos = TRUE, min.pct = 0, logfc.threshold = 0)
+
+degs_filtered <- signature.cell.markers %>%
+  filter(p_val_adj < 0.1, gene %in% universe)
+```
+
+```{r grouped-ora}
+ora_results_tfh <- run_signature_ora(degs_filtered, tfh_signature, universe, "Tfh", celltype_levels)
+ora_results_th1 <- run_signature_ora(degs_filtered, th1_signature, universe, "Th1", celltype_levels)
+ora_results_t0  <- run_signature_ora(degs_filtered, t0_signature, universe, "T0", celltype_levels)
+
+ora_results_all <- bind_rows(ora_results_tfh, ora_results_th1, ora_results_t0)
+print(ora_results_all)
+
+write.csv(ora_results_all, paste0(table_dir, "ORA_grouped_Tcells.csv"), row.names = FALSE)
+```
+
+```{r grouped-ora-heatmap}
+ora_signature_order <- c("T0", "Tfh", "Th1")
+
+heatmap_data <- ora_results_all %>%
+  dplyr::select(cluster, p_adj, odds_ratio, Type) %>%
+  dplyr::mutate(cluster = as.character(cluster), Type = as.character(Type)) %>%
+  tidyr::complete(cluster = celltype_levels, Type = ora_signature_order) %>%
+  dplyr::mutate(
+    cluster = factor(cluster, levels = celltype_levels),
+    Type = factor(Type, levels = rev(ora_signature_order)),
+    p_bin = bin_padj(p_adj)
+  )
+
+p1 <- ggplot(heatmap_data, aes(x = cluster, y = Type, fill = p_bin)) +
+  geom_tile(color = "black", linewidth = 0.3) +
+  scale_x_discrete(drop = FALSE) +
+  scale_y_discrete(drop = FALSE) +
+  padj_fill_scale(name = "Adjusted P") +
+  labs(title = "Signature enrichment across T-cell populations", x = NULL, y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    legend.position = "right",
+    panel.grid = element_blank()
+  )
+
+print(p1)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

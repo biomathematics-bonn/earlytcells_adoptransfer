@@ -1,0 +1,23 @@
+name: scRNA_FunctionalEnrichment
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - bioconductor-clusterprofiler
+  - r-ggvenn
+  - r-msigdbr
+  - r-seurat
+  - conda-forge::r-tidyverse
+  - bioconda::bioconductor-org.mm.eg.db
+  - conda-forge::r-devtools
+  - conda-forge::r-dt
+  - bioconda::bioconductor-deseq2
+  - bioconda::bioconductor-geoquery
+  - conda-forge::r-readxl
+  - conda-forge::r-pheatmap
+  - conda-forge::biomart
+  - bioconda::bioconductor-biomart
+  - bioconda::bioconductor-edger
+  - conda-forge::r-babelgene
+  - conda-forge::r-bookdown
+prefix: /home/lisbet/miniconda3/envs/scRNA_FunctionalEnrichment

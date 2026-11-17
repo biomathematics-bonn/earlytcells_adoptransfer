@@ -1,0 +1,195 @@
+---
+title: "scRNA-seq adoptive transfer – 01 Preprocessing and sample integration"
+author: "Lisa M. Steinheuer"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+abstract: |
+  Read-in of the Cell Ranger count matrices (gene expression + antibody capture), cell QC, filtering and
+  anchor-based integration of the four sampling days.
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: united
+    highlight: tango
+---
+
+# Background
+
+Adoptive transfer of antigen-specific T and B cells followed by subcutaneous immunisation.
+Tissue: draining lymph nodes. Sampling days: Day 0, 2, 4, 6.
+
+**Input:** Cell Ranger output per sample (`<input>/<Day>/`, filtered feature-barcode matrices)
+**Output:**
+
+* `RDS_initial_Seurat_scTfh23.rds` – merged, unfiltered object
+* `RDS_integrated_Seurat_scTfh23.rds` – filtered and integrated object
+* `RDS_integrated_Seurat_SCE_scTfh23.RData` – SingleCellExperiment for doublet detection (`02_doublet_detection.R`)
+
+Next: `02_doublet_detection.R`, then `03_clustering_TB_annotation.Rmd`.
+
+# Setup
+
+Conda environment: *Seurat_toolbox2*.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 5, fig.height = 4)
+```
+
+```{r libraries}
+library(dplyr)
+library(Seurat)
+library(foreach)
+library(Matrix)
+library(purrr)
+library(ggplot2)
+```
+
+```{r paths}
+project <- "scTfh23"
+input   <- "../data/01_Counts/"
+rdata   <- "../RData/"
+results <- "../results/"
+
+# 1 = recompute from the count matrices / rerun the integration, 0 = load saved objects
+recalculate_switch      <- 0
+recalculate_integration <- 0
+
+color_vector_samples <- c(
+  "Day0" = "#fdb863",
+  "Day2" = "#e66101",
+  "Day4" = "#b2abd2",
+  "Day6" = "#54009E")
+```
+
+# Read in the count data
+
+Basic prefiltering: genes detected in ≥ 3 cells, cells with ≥ 200 detected genes.
+The antibody-capture (ADT) counts are stored as a second assay.
+
+```{r sample-read-in}
+if (recalculate_switch == 1) {
+  which_samples <- list.dirs(input, recursive = FALSE)
+
+  list_seurat <- foreach(i = as.character(which_samples), .packages = c("Matrix", "Seurat")) %dopar% {
+    seurat.data <- Read10X(data.dir = i)
+    rownames(seurat.data[["Antibody Capture"]]) <- gsub(pattern = "*_TotalSeqC", replacement = "",
+                                                         x = rownames(seurat.data[["Antibody Capture"]]))
+    obj <- CreateSeuratObject(counts = seurat.data[["Gene Expression"]],
+                              project = gsub(i, pattern = paste0(input, "/"), replacement = ""),
+                              min.cells = 3, min.features = 200)
+    obj[["ADT"]] <- CreateAssayObject(seurat.data[["Antibody Capture"]][, colnames(obj)])
+    obj
+  }
+
+  # merge all samples
+  seurat.Tfh <- reduce(list_seurat, merge)
+  saveRDS(seurat.Tfh, file = paste0(rdata, "RDS_initial_Seurat_", project, ".rds"))
+} else {
+  seurat.Tfh <- readRDS(paste0(rdata, "RDS_initial_Seurat_", project, ".rds"))
+}
+
+table(seurat.Tfh$orig.ident)
+```
+
+Cell numbers differ between samples (Day 2 ≈ 6× more cells than Day 6, Day 4 ≈ 2×); sequencing saturation
+(Cell Ranger summary) was lowest for Day 2.
+
+# Cell QC
+
+```{r qc-metrics, fig.width = 9, fig.height = 4, fig.cap = "QC metrics per sample before filtering."}
+seurat.Tfh[["percent.mt"]] <- PercentageFeatureSet(seurat.Tfh, pattern = "^mt-")
+seurat.Tfh[["percent.rb"]] <- PercentageFeatureSet(seurat.Tfh, pattern = "^Rp[sl]")
+seurat.Tfh[["percent.hb"]] <- PercentageFeatureSet(seurat.Tfh, pattern = "^Hb")
+
+VlnPlot(seurat.Tfh, group.by = "orig.ident",
+        features = c("nFeature_RNA", "nCount_RNA", "nCount_ADT", "percent.mt", "percent.hb"),
+        ncol = 5, pt.size = 0, cols = color_vector_samples)
+```
+
+```{r qc-features, fig.width = 12, fig.cap = "Number of detected genes; line = threshold (800)."}
+p1 <- seurat.Tfh@meta.data %>%
+  ggplot(aes(x = nFeature_RNA, fill = orig.ident)) +
+  geom_histogram(binwidth = 100) +
+  xlim(c(0, 7500)) + ylim(c(0, 5000)) +
+  geom_vline(xintercept = 800) +
+  scale_fill_manual(values = color_vector_samples)
+
+p2 <- VlnPlot(seurat.Tfh, group.by = "orig.ident", features = "nFeature_RNA", pt.size = 0,
+              cols = color_vector_samples) +
+  ylim(c(0, 7500)) + geom_hline(yintercept = 800)
+
+cowplot::plot_grid(p1, p2, labels = c("A", "B"))
+```
+
+```{r qc-mito, fig.width = 12, fig.cap = "Mitochondrial gene content; line = threshold (10 %)."}
+p1 <- seurat.Tfh@meta.data %>%
+  ggplot(aes(x = percent.mt, fill = orig.ident)) +
+  geom_histogram(binwidth = 1) +
+  xlim(c(0, 20)) + ylim(c(0, 11000)) +
+  geom_vline(xintercept = 10) +
+  scale_fill_manual(values = color_vector_samples)
+
+p2 <- VlnPlot(seurat.Tfh, group.by = "orig.ident", features = "percent.mt", pt.size = 0,
+              cols = color_vector_samples) +
+  ylim(c(0, 50)) + geom_hline(yintercept = 10)
+
+cowplot::plot_grid(p1, p2, labels = c("A", "B"))
+```
+
+## Filtering
+
+Cells are kept with > 800 detected genes, < 10 % mitochondrial and < 0.05 % haemoglobin reads.
+No upper threshold on genes/counts, because activated cells can have a higher gene content.
+
+```{r filtering}
+seurat.Tfh.filtered <- subset(seurat.Tfh, subset = nFeature_RNA > 800 &
+                                percent.mt < 10 &
+                                percent.hb < 0.05)
+rm(seurat.Tfh)
+
+table(seurat.Tfh.filtered$orig.ident)
+```
+
+```{r qc-after-filtering, fig.width = 12, fig.height = 4, fig.cap = "QC metrics after filtering."}
+VlnPlot(seurat.Tfh.filtered, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "nCount_ADT"),
+        ncol = 4, pt.size = 0, cols = color_vector_samples)
+```
+
+# Sample integration
+
+Without integration the cells cluster by sampling day. Samples are therefore log-normalised separately
+(2,000 variable genes each) and integrated with Seurat anchors (`FindIntegrationAnchors`, `IntegrateData`).
+
+```{r integration}
+if (recalculate_integration == 1) {
+  split_seurat <- SplitObject(seurat.Tfh.filtered, split.by = "orig.ident")
+
+  split_seurat <- lapply(split_seurat, function(x) {
+    x <- NormalizeData(x)
+    FindVariableFeatures(x, nfeatures = 2000)
+  })
+
+  features <- SelectIntegrationFeatures(object.list = split_seurat)
+  anchors  <- FindIntegrationAnchors(object.list = split_seurat, anchor.features = features)
+
+  seurat.integrated <- IntegrateData(anchorset = anchors)
+  DefaultAssay(seurat.integrated) <- "integrated"
+  saveRDS(seurat.integrated, file = paste0(rdata, "RDS_integrated_Seurat_", project, ".rds"))
+} else {
+  seurat.integrated <- readRDS(file = paste0(rdata, "RDS_integrated_Seurat_", project, ".rds"))
+}
+rm(seurat.Tfh.filtered)
+```
+
+# Export for doublet detection
+
+```{r export-sce}
+DefaultAssay(seurat.integrated) <- "RNA"
+tfh.sce <- as.SingleCellExperiment(seurat.integrated)
+save(tfh.sce, file = paste0(rdata, "RDS_integrated_Seurat_SCE_", project, ".RData"))
+```
+
+```{r session-info}
+sessionInfo()
+```

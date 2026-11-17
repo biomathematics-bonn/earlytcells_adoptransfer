@@ -1,0 +1,133 @@
+---
+title: "scRNA-seq adoptive transfer – 03 Clustering and T/B-cell annotation"
+author: "Lisa M. Steinheuer"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+abstract: |
+  Clustering of the integrated data set, doublet annotation and assignment of clusters to T and B cells.
+output:
+  bookdown::html_document2:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: united
+    highlight: tango
+---
+
+**Input:**
+
+* `RDS_integrated_Seurat_scTfh23.rds` (01)
+* `DoubletScanner_scTfh23.csv` (02)
+* `DF_Manual Annotation.csv` – manual assignment of every cluster to a major cell type
+
+**Output:** `RDS_integrated_Seurat_T_B.rds` – integrated object with `Doublets` and `Celltype` (T cells / B cells / …)
+
+Next: `04_Tcell_annotation_analysis.Rmd`
+
+# Setup
+
+Conda environment: *Seurat_toolbox2*.
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 5, fig.height = 4)
+```
+
+```{r libraries}
+library(dplyr)
+library(Seurat)
+library(ggplot2)
+library(DT)
+```
+
+```{r paths}
+project <- "scTfh23"
+rdata   <- "../RData/"
+results <- "../results/"
+
+color_vector_samples <- c(
+  "Day0" = "#fdb863",
+  "Day2" = "#e66101",
+  "Day4" = "#b2abd2",
+  "Day6" = "#54009E")
+```
+
+# Load data and add doublet calls
+
+```{r load}
+seurat.integrated <- readRDS(file = paste0(rdata, "RDS_integrated_Seurat_", project, ".rds"))
+
+doublet_info <- read.csv(file = paste0(rdata, "DoubletScanner_", project, ".csv"), row.names = 1)
+seurat.integrated$Doublets <- factor(doublet_info[rownames(seurat.integrated@meta.data), "scDblFinder.class"])
+table(seurat.integrated$Doublets)
+```
+
+# Clustering and UMAP
+
+Scaling (RNA: all genes; integrated assay), PCA (30 PCs), Louvain clustering (resolution 1), UMAP.
+Doublets are kept here and removed in the T-cell analysis (04).
+
+```{r clustering}
+DefaultAssay(seurat.integrated) <- "RNA"
+seurat.integrated <- ScaleData(seurat.integrated, features = rownames(seurat.integrated))
+
+DefaultAssay(seurat.integrated) <- "integrated"
+seurat.integrated <- ScaleData(seurat.integrated, verbose = FALSE)
+seurat.integrated <- RunPCA(seurat.integrated, npcs = 30, verbose = FALSE)
+seurat.integrated <- FindNeighbors(seurat.integrated, dims = 1:30)
+seurat.integrated <- FindClusters(seurat.integrated, resolution = 1)
+seurat.integrated <- RunUMAP(seurat.integrated, reduction = "pca", dims = 1:30)
+```
+
+```{r plot-doublets, fig.height = 4, fig.cap = "Doublets and singlets (scDblFinder)."}
+DimPlot(seurat.integrated, reduction = "umap", group.by = "Doublets") + ggtitle("Cells colored by Doublets")
+```
+
+```{r plot-umap, fig.width = 12, fig.height = 5, fig.cap = "UMAP of integrated samples. (A) Sample. (B) Louvain clusters."}
+seurat.integrated$seurat_clusters <- factor(
+  seurat.integrated$seurat_clusters,
+  levels = 0:(length(unique(seurat.integrated$seurat_clusters)) - 1))
+
+p1 <- DimPlot(seurat.integrated, reduction = "umap", group.by = "orig.ident", cols = color_vector_samples) +
+  ggtitle("Cells colored by sample")
+p2 <- DimPlot(seurat.integrated, reduction = "umap", label = TRUE, repel = TRUE, group.by = "integrated_snn_res.1") +
+  ggtitle("Cells colored by clusters")
+cowplot::plot_grid(p1, p2, labels = c("A", "B"))
+
+table(seurat.integrated$orig.ident)
+```
+
+# Annotation of T and B cells
+
+T- and B-cell marker expression per cluster; clusters were assigned manually (`DF_Manual Annotation.csv`).
+
+```{r marker-dotplot, fig.width = 10, fig.height = 6, fig.cap = "T- and B-cell markers per cluster."}
+DefaultAssay(seurat.integrated) <- "RNA"
+DotPlot(seurat.integrated,
+        features = c("Cd4", "Cd3d", "Cd3g", "Ltb", "Cd3e", "Cd79a", "Cd79b", "Cd74", "Mef2c"),
+        group.by = "integrated_snn_res.1", assay = "RNA") +
+  scale_color_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, space = "Lab", na.value = "grey50") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+```{r annotation, fig.cap = "UMAP colored by major cell type."}
+annotation_df <- read.table(paste0(results, "DF_Manual Annotation.csv"), sep = ";", header = TRUE, row.names = 1)
+datatable(annotation_df)
+
+Idents(seurat.integrated) <- "seurat_clusters"
+new.cluster.ids <- annotation_df$Celltype
+names(new.cluster.ids) <- levels(seurat.integrated)
+seurat.integrated <- RenameIdents(seurat.integrated, new.cluster.ids)
+seurat.integrated <- AddMetaData(seurat.integrated, metadata = Idents(seurat.integrated), col.name = "Celltype")
+
+DimPlot(seurat.integrated, reduction = "umap", label = FALSE, pt.size = 0.5, group.by = "Celltype")
+table(seurat.integrated$Celltype)
+```
+
+# Save
+
+```{r save}
+saveRDS(seurat.integrated, file = paste0(rdata, "RDS_integrated_Seurat_T_B.rds"))
+```
+
+```{r session-info}
+sessionInfo()
+```
